@@ -17,6 +17,9 @@ import boom.v4.util._
 
 class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge: TLEdgeOut, p: Parameters) extends BoomModule()(p) {
   require(!instruction)
+  val sectoredEntryCount = (cfg.nSets * cfg.nWays) / cfg.nSectors
+  def sectorMatch(a: UInt, b: UInt): Bool =
+    ((a ^ b) >> log2Ceil(cfg.nSectors)) === 0.U
   val io = IO(new Bundle {
     val req = Flipped(Vec(lsuWidth, Decoupled(new TLBReq(lgMaxSize))))
     val miss_rdy = Output(Bool())
@@ -24,12 +27,21 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val sfence = Input(Valid(new SFenceReq))
     val ptw = new TLBPTWIO
     val kill = Input(Bool())
+    // In-flight LDQ/STQ misses. Registers in the LSU; must not depend on the
+    // outputs below or the lock and the hold form a combinational loop.
+    val hold_ldq = Input(Vec(numLdqEntries, Valid(UInt(vpnBits.W))))
+    val hold_stq = Input(Vec(numStqEntries, Valid(UInt(vpnBits.W))))
+    // Every valid sectored entry is locked, so a 4KB miss has nowhere to land
+    // unless it is already a sector hit.
+    val no_sectored_victim = Output(Bool())
+    val locked_vpn = Output(Vec(sectoredEntryCount, Valid(UInt(vpnBits.W))))
   })
 
   class EntryData extends Bundle {
     val ppn = UInt(ppnBits.W)
     val u = Bool()
     val g = Bool()
+    val asid = UInt((asIdBits max 1).W)
     val ae = Bool()
     val sw = Bool()
     val sx = Bool()
@@ -53,13 +65,17 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     val tag = UInt(vpnBits.W)
     val data = Vec(nSectors, UInt(new EntryData().getWidth.W))
     val valid = Vec(nSectors, Bool())
+    // Set while an LSU hold covers this sector tag, from the refill (or the
+    // cycle after the hold) until the replay hits. Replacement skips it.
+    // Superpage entries keep this false; only the 4KB sector array uses it.
+    val locked = Bool()
     def entry_data = data.map(_.asTypeOf(new EntryData))
 
     private def sectorIdx(vpn: UInt) = vpn.extract(log2Ceil(nSectors)-1, 0)
     def getData(vpn: UInt) = OptimizationBarrier(data(sectorIdx(vpn)).asTypeOf(new EntryData))
     def sectorHit(vpn: UInt) = valid.orR && sectorTagMatch(vpn)
     def sectorTagMatch(vpn: UInt) = ((tag ^ vpn) >> log2Ceil(nSectors)) === 0.U
-    def hit(vpn: UInt) = {
+    def vpnHit(vpn: UInt): Bool = {
       if (superpage && usingVM) {
         var tagMatch = valid.head
         for (j <- 0 until pgLevels) {
@@ -73,6 +89,14 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
         valid(idx) && sectorTagMatch(vpn)
       }
     }
+    def asidHit(vpn: UInt, asid: UInt): Bool = {
+      if (asIdBits == 0) true.B
+      else {
+        val d = getData(vpn)
+        d.g || d.asid === asid
+      }
+    }
+    def hit(vpn: UInt, asid: UInt): Bool = vpnHit(vpn) && asidHit(vpn, asid)
     def ppn(vpn: UInt) = {
       val data = getData(vpn)
       if (superpage && usingVM) {
@@ -99,7 +123,7 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     def invalidate() { valid.foreach(_ := false.B) }
     def invalidateVPN(vpn: UInt) {
       if (superpage) {
-         when (hit(vpn)) { invalidate() }
+         when (vpnHit(vpn)) { invalidate() }
       } else {
         when (sectorTagMatch(vpn)) { valid(sectorIdx(vpn)) := false.B }
 
@@ -120,19 +144,30 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   def widthMap[T <: Data](f: Int => T) = VecInit((0 until lsuWidth).map(f))
 
   val pageGranularityPMPs = pmpGranularity >= (1 << pgIdxBits)
-  val sectored_entries = Reg(Vec((cfg.nSets * cfg.nWays) / cfg.nSectors, new Entry(cfg.nSectors, false, false)))
+  val sectored_entries = Reg(Vec(sectoredEntryCount, new Entry(cfg.nSectors, false, false)))
   val superpage_entries = Reg(Vec(cfg.nSuperpageEntries, new Entry(1, true, true)))
   val special_entry = (!pageGranularityPMPs).option(Reg(new Entry(1, true, false)))
   def ordinary_entries = sectored_entries ++ superpage_entries
   def all_entries = ordinary_entries ++ special_entry
 
+  val holds = io.hold_ldq ++ io.hold_stq
+  def vpnHeld(vpn: UInt): Bool =
+    holds.map(hold => hold.valid && sectorMatch(hold.bits, vpn)).reduce(_ || _)
+  def entryLocked(entry: Entry): Bool =
+    entry.locked || (!entry.superpage).B && vpnHeld(entry.tag)
+  val have_sectored_victim = sectored_entries.map(entry =>
+    !entry.valid.orR || !entryLocked(entry)).reduce(_ || _)
+
   val s_ready :: s_request :: s_wait :: s_wait_invalidate :: Nil = Enum(4)
   val state = RegInit(s_ready)
   val r_refill_tag = Reg(UInt(vpnBits.W))
+  val r_refill_asid = Reg(UInt((asIdBits max 1).W))
   val r_superpage_repl_addr = Reg(UInt(log2Ceil(superpage_entries.size).W))
   val r_sectored_repl_addr = Reg(UInt(log2Ceil(sectored_entries.size).W))
   val r_sectored_hit_addr = Reg(UInt(log2Ceil(sectored_entries.size).W))
   val r_sectored_hit = Reg(Bool())
+  val refill_waddr = Mux(r_sectored_hit, r_sectored_hit_addr,
+    replacementEntry(sectored_entries, r_sectored_repl_addr))
 
   val priv = if (instruction) io.ptw.status.prv else io.ptw.status.dprv
   val priv_s = priv(0)
@@ -172,20 +207,22 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   val prot_eff = widthMap(w => fastCheck(Seq(RegionType.PUT_EFFECTS, RegionType.GET_EFFECTS) contains _.regionType, w))
 
   val sector_hits = widthMap(w => VecInit(sectored_entries.map(_.sectorHit(vpn(w)))))
-  val superpage_hits = widthMap(w => VecInit(superpage_entries.map(_.hit(vpn(w)))))
-  val hitsVec = widthMap(w => VecInit(all_entries.map(vm_enabled(w) && _.hit(vpn(w)))))
+  val lookup_asid = io.ptw.ptbr.asid((asIdBits max 1) - 1, 0)
+  val superpage_hits = widthMap(w => VecInit(superpage_entries.map(_.hit(vpn(w), lookup_asid))))
+  val hitsVec = widthMap(w => VecInit(all_entries.map(vm_enabled(w) && _.hit(vpn(w), lookup_asid))))
   val real_hits = widthMap(w => hitsVec(w).asUInt)
   val hits = widthMap(w => Cat(!vm_enabled(w), real_hits(w)))
   val ppn = widthMap(w => Mux1H(hitsVec(w) :+ !vm_enabled(w), all_entries.map(_.ppn(vpn(w))) :+ vpn(w)(ppnBits-1, 0)))
 
     // permission bit arrays
-  when (do_refill) {
+  when (do_refill && !invalidate_refill) {
     val pte = io.ptw.resp.bits.pte
     val newEntry = Wire(new EntryData)
     newEntry.ppn := pte.ppn
     newEntry.c := cacheable(0)
     newEntry.u := pte.u
     newEntry.g := pte.g
+    newEntry.asid := r_refill_asid
     newEntry.ae := io.ptw.resp.bits.ae_final
     newEntry.sr := pte.sr()
     newEntry.sw := pte.sw()
@@ -199,14 +236,16 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     newEntry.fragmented_superpage := io.ptw.resp.bits.fragmented_superpage
 
     when (special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) {
-      special_entry.foreach(_.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry))
+      special_entry.foreach { e =>
+        e.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry)
+      }
     }.elsewhen (io.ptw.resp.bits.level < (pgLevels-1).U) {
       for ((e, i) <- superpage_entries.zipWithIndex) when (r_superpage_repl_addr === i.U) {
         e.insert(r_refill_tag, io.ptw.resp.bits.level, newEntry)
       }
     }.otherwise {
-      val waddr = Mux(r_sectored_hit, r_sectored_hit_addr, r_sectored_repl_addr)
-      for ((e, i) <- sectored_entries.zipWithIndex) when (waddr === i.U) {
+      for ((e, i) <- sectored_entries.zipWithIndex) when (
+          (r_sectored_hit || have_sectored_victim) && refill_waddr === i.U) {
         when (!r_sectored_hit) { e.invalidate() }
         e.insert(r_refill_tag, 0.U, newEntry)
       }
@@ -323,11 +362,13 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
   io.ptw.req.bits := DontCare
   io.ptw.req.bits.valid := !io.kill
   io.ptw.req.bits.bits.addr := r_refill_tag
+  io.ptw.req.bits.bits.asid := lookup_asid
 
   if (usingVM) {
     val sfence = io.sfence.valid
     for (w <- 0 until lsuWidth) {
-      when (io.req(w).fire && tlb_miss(w) && state === s_ready) {
+      when (io.req(w).fire && tlb_miss(w) && state === s_ready &&
+            (sector_hits(w).orR || have_sectored_victim)) {
         state := s_request
         r_refill_tag := vpn(w)
 
@@ -348,6 +389,9 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     when (io.ptw.resp.valid) {
       state := s_ready
     }
+    when (io.ptw.req.fire && io.ptw.req.bits.valid) {
+      r_refill_asid := io.ptw.req.bits.bits.asid
+    }
 
     when (sfence) {
       for (w <- 0 until lsuWidth) {
@@ -364,9 +408,50 @@ class NBDTLB(instruction: Boolean, lgMaxSize: Int, cfg: TLBConfig)(implicit edge
     }
   }
 
+  // !usingVM keeps enqueue unrestricted. usingVM overrides both.
+  io.no_sectored_victim := false.B
+  for (i <- 0 until sectoredEntryCount) {
+    io.locked_vpn(i).valid := false.B
+    io.locked_vpn(i).bits := 0.U
+  }
+
+  if (usingVM) {
+    // Same condition as the base-page arm of the refill mux above.
+    val base_page_refill = do_refill && !invalidate_refill &&
+      !(special_entry.nonEmpty.B && !io.ptw.resp.bits.homogeneous) &&
+      (io.ptw.resp.bits.level === (pgLevels - 1).U) &&
+      (r_sectored_hit || have_sectored_victim)
+    val refill_held = vpnHeld(r_refill_tag)
+
+    // Superpage/special entries are never locked. An invalidated tag is an
+    // empty victim even if this bit lags one cycle, so sfence does not need
+    // to clear locks itself. Reset does, because the Reg is not reset.
+    for (e <- superpage_entries) { e.locked := false.B }
+    special_entry.foreach(_.locked := false.B)
+    for ((e, i) <- sectored_entries.zipWithIndex) {
+      val refilled = base_page_refill && (refill_waddr === i.U)
+      val held_now = e.valid.orR && vpnHeld(e.tag)
+      // Replacement: e.tag is still the victim, so only r_refill_tag counts.
+      // Sector-hit refill keeps the other 4KB slots; OR in holds already on
+      // this tag or the new page would clear their lock.
+      val held = Mux(refilled, refill_held || (r_sectored_hit && held_now), held_now)
+      e.locked := held && !reset.asBool
+      io.locked_vpn(i).valid := e.valid.orR && entryLocked(e)
+      io.locked_vpn(i).bits := e.tag
+    }
+    io.no_sectored_victim := !have_sectored_victim
+  }
+
   def replacementEntry(set: Seq[Entry], alt: UInt) = {
     val valids = set.map(_.valid.orR).asUInt
-    Mux(valids.andR, alt, PriorityEncoder(~valids))
+    val empty = (~valids).asUInt
+    // PLRU among currently unlocked valid entries. Empty entries still win,
+    // and a locked entry is never chosen. Callers that need a victim must
+    // have already checked that one exists; a sector-hit refill ignores this.
+    val replaceable = VecInit(set.map(entry => entry.valid.orR && !entryLocked(entry))).asUInt
+    Mux(empty.orR,
+      PriorityEncoder(empty),
+      Mux(replaceable(alt), alt, PriorityEncoder(replaceable)))
   }
 
 
