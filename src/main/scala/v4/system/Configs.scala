@@ -23,7 +23,7 @@ class WithBoomSupervisor extends Config((site, here, up) => {
         useSupervisor = true,
         useVM = true,
         useDebug = false,
-        nPMPs = 8)))
+        nPMPs = 16)))
     case other => other
   }
 })
@@ -49,3 +49,8 @@ class BoomBaseConfig extends Config(
 class SmallBoomConfig extends Config(new WithBoomSupervisor ++ new WithNSmallBooms(1) ++ new BoomBaseConfig)
 class MediumBoomConfig extends Config(new WithBoomSupervisor ++ new WithNMediumBooms(1) ++ new BoomBaseConfig)
 class LargeBoomConfig extends Config(new WithBoomSupervisor ++ new WithNLargeBooms(1) ++ new BoomBaseConfig)
+class MediumBoomMem2GConfig extends Config(
+  new WithExtMemSize(BigInt("80000000", 16)) ++
+  new WithBoomSupervisor ++
+  new WithNMediumBooms(1) ++
+  new BoomBaseConfig)
