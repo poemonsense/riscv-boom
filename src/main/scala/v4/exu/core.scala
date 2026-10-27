@@ -1397,7 +1397,8 @@ class BoomCore(roccCSRs: Seq[Seq[CustomCSR]])(implicit p: Parameters) extends Bo
     val commit = DifftestModule(new DiffInstrCommit(math.max(diffNumIntPhysRegs, numFpPhysRegs)), delay = 0)
     commit.coreid := 0.U
     commit.index := w.U
-    commit.valid := commitValid
+    // Report test termination through TrapEvent without executing it in REF.
+    commit.valid := commitValid && !(commitInst === NEMU_TRAP)
     // Hardware performance counters are intentionally implementation-defined
     // and BOOM's counters advance differently from NEMU's.  Treat their CSR
     // accesses like MMIO so DiffTest copies the architectural result while

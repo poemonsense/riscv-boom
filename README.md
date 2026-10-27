@@ -72,8 +72,8 @@ Please see [CONTRIB\_AND\_STYLE.md](/CONTRIB_AND_STYLE.md)
 The `dev-difftest` branch adds a standalone BOOM v4 Verilator harness alongside
 the Chipyard flow described above. It supports single-hart `SmallBoomConfig`,
 `MediumBoomConfig` (the default), and `LargeBoomConfig`, with F/D floating point,
-Zba/Zbb/Zbs, Sv39, and eight PMP regions at four-byte granularity. The harness
-provides 256 MiB DRAM at `0x80000000`, CLINT at `0x02000000`, PLIC at
+Zba/Zbb/Zbs, Sv39, and sixteen PMP regions at four-byte granularity. The harness
+defaults to 2 GiB DRAM at `0x80000000`, CLINT at `0x02000000`, PLIC at
 `0x0c000000`, and an ns16550 UART at `0x10000000`.
 
 Install JDK 17, Mill 0.11.1, Verilator 5, a C/C++ toolchain, Make, and Python 3.
@@ -92,6 +92,24 @@ Use `make verilog CONFIG=SmallBoomConfig` to generate RTL only. Outputs are
 isolated by configuration under `build/boom-<CONFIG>/build/`; the emulator is
 `build/boom-<CONFIG>/build/emu`. `BUILD_DIR` can select another output directory.
 
+`SmallBoomFpgaConfig`, `MediumBoomFpgaConfig`, and `LargeBoomFpgaConfig` select
+the same core sizes with external MMIO AXI for the board UART16550 at
+`0x310b0000` (64-bit data, two-bit IDs), rather than the simulated UART.
+Large permits 16-byte MMIO transfers over two beats for its instruction TLB;
+Small and Medium retain the eight-byte maximum.
+Both families default to 2 GiB. Pass a byte count in decimal or hexadecimal
+with `MEM_SIZE`, for example `make verilog CONFIG=SmallBoomConfig MEM_SIZE=0x10000000`
+for the former 256 MiB map. The generator accepts the same value through
+`--mem-size`; Scala callers can pass `memSize` to each configuration.
+Memory size is selected only by the parameter, without separate Mem2G
+configuration names. Keep the workload DTB and host/REF RAM size consistent
+with the selected memory map.
+
+Both UART configurations use the same NEMU references:
+`riscv64-boom-ref_defconfig` and `riscv64-boom-fastref_defconfig`.
+DiffTest skips UART MMIO instructions, so neither REF needs a UART model or
+a separate FPGA configuration.
+
 For the reference model, use an OpenXiangShan NEMU checkout containing
 `configs/riscv64-boom-ref_defconfig`. Assuming NEMU and workload-builder are
 siblings of this repository, build the shared reference from the BOOM config:
@@ -102,7 +120,7 @@ make -C "$NEMU_HOME" riscv64-boom-ref_defconfig
 make -C "$NEMU_HOME" -j"$(nproc)"
 ```
 
-This configuration enables SoftFloat F/D, floating-point CSR comparison, eight
+This configuration enables SoftFloat F/D, floating-point CSR comparison, sixteen
 active PMP entries, Sv39, and the harness memory map. Use it instead of a
 NutShell reference: both the floating-point register layout and ISA/PMP
 configuration must match the DUT. DiffTest compares integer and floating-point
@@ -110,13 +128,13 @@ registers, FCSR, privileged CSR state, retirement, traps, and LR/SC events.
 Device accesses and implementation-dependent performance counters are skipped.
 
 To build and run the Linux hello payload, the workload-builder checkout must
-contain `dts/boom.dts.in`:
+contain the `boom-mem2g` DTS profile:
 
 ```sh
-make -C ../workload-builder linux/hello DEFAULT_DTB=boom -j"$(nproc)"
+make -C ../workload-builder linux/hello DEFAULT_DTB=boom-mem2g -j"$(nproc)"
 build/boom-SmallBoomConfig/build/emu \
   -i ../workload-builder/build/linux-workloads/hello/fw_payload.bin \
-  --diff "$NEMU_HOME/build/riscv64-nemu-interpreter-so" --ram-size=256MB
+  --diff "$NEMU_HOME/build/riscv64-nemu-interpreter-so" --ram-size=2GB
 ```
 
 Repeat `make emu` and the run command with `MediumBoomConfig` or `LargeBoomConfig`

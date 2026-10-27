@@ -577,7 +577,9 @@ class Rob(
     will_throw_exception = (can_throw_exception(w) && !block_commit && !block_xcpt) || will_throw_exception
 
     will_commit(w)       := can_commit(w) && !can_throw_exception(w) && !block_commit
-    block_commit         = (rob_head_vals(w) &&
+    // Keep the architectural snapshot at a flushing instruction's boundary.
+    block_commit         = (will_commit(w) && io.commit.uops(w).flush_on_commit) ||
+                           (rob_head_vals(w) &&
                            (!can_commit(w) || can_throw_exception(w))) || block_commit
     block_xcpt           = will_commit(w)
   }

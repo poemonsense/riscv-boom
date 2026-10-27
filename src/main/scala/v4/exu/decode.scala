@@ -533,9 +533,10 @@ class DecodeUnit(implicit p: Parameters) extends BoomModule
   uop.is_sfence  := inst === SFENCE_VMA
   uop.is_sys_pc2epc := inst === EBREAK || inst === ECALL
   uop.is_eret    := inst === ECALL || inst === EBREAK || inst === SRET || inst === MRET || inst === DRET
-  uop.is_unique  := cs.inst_unique
+  val is_nemu_trap = inst === NEMU_TRAP
+  uop.is_unique  := cs.inst_unique || is_nemu_trap
   uop.is_rocc    := inst(6,0).isOneOf("b0001011".U, "b0101011".U, "b1111011".U) && inst(14,12).isOneOf(0.U, 2.U, 3.U, 4.U, 6.U, 7.U)
-  uop.flush_on_commit := cs.flush_on_commit || (csr_en && !csr_ren && io.csr_decode.write_flush)
+  uop.flush_on_commit := cs.flush_on_commit || is_nemu_trap || (csr_en && !csr_ren && io.csr_decode.write_flush)
 
 
   //-------------------------------------------------------------
