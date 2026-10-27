@@ -233,6 +233,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val ldq_span_page           = Reg(Vec(numLdqEntries, Bool()))
   val ldq_addr_is_virtual     = Reg(Vec(numLdqEntries, Bool()))
   val ldq_addr_is_uncacheable = Reg(Vec(numLdqEntries, Bool()))
+  // Set on a TLB miss, cleared on a hit. Survives retry-queue enqueue, which
+  // clears ldq_addr.valid but keeps the VPN in ldq_addr.bits.
+  val ldq_tlb_hold            = RegInit(VecInit(Seq.fill(numLdqEntries)(false.B)))
   val ldq_executed            = Reg(Vec(numLdqEntries, Bool()))
   val ldq_succeeded           = Reg(Vec(numLdqEntries, Bool()))
   val ldq_order_fail          = Reg(Vec(numLdqEntries, Bool()))
@@ -266,6 +269,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val stq_addr            = Reg(Vec(numStqEntries, Valid(UInt(coreMaxAddrBits.W))))
   val stq_addr_is_virtual = Reg(Vec(numStqEntries, Bool()))
   val stq_addr_is_uncacheable = Reg(Vec(numStqEntries, Bool()))
+  val stq_tlb_hold        = RegInit(VecInit(Seq.fill(numStqEntries)(false.B)))
   val stq_data            = Reg(Vec(numStqEntries, Valid(UInt(xLen.W))))
   val stq_committed       = Reg(Vec(numStqEntries, Bool()))
   val stq_succeeded       = Reg(Vec(numStqEntries, Bool()))
@@ -321,8 +325,24 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val hella_xcpt            = Reg(new rocket.HellaCacheExceptions)
 
 
+  val dtlbCfg = rocket.TLBConfig(dcacheParams.nTLBSets, dcacheParams.nTLBWays)
   val dtlb = Module(new NBDTLB(
-    instruction = false, lgMaxSize = log2Ceil(coreDataBytes), rocket.TLBConfig(dcacheParams.nTLBSets, dcacheParams.nTLBWays)))
+    instruction = false, lgMaxSize = log2Ceil(coreDataBytes), dtlbCfg))
+  def tlb_vpn(addr: UInt) = addr(vaddrBits - 1, pgIdxBits)
+  def tlb_sector_covered(addr: UInt): Bool = {
+    val vpn = tlb_vpn(addr)
+    dtlb.io.locked_vpn.map { e =>
+      e.valid && (((vpn ^ e.bits) >> log2Ceil(dtlbCfg.nSectors)) === 0.U)
+    }.reduce(_ || _)
+  }
+  for (i <- 0 until numLdqEntries) {
+    dtlb.io.hold_ldq(i).valid := ldq_tlb_hold(i) && ldq_valid(i)
+    dtlb.io.hold_ldq(i).bits  := tlb_vpn(ldq_addr(i).bits)
+  }
+  for (i <- 0 until numStqEntries) {
+    dtlb.io.hold_stq(i).valid := stq_tlb_hold(i) && stq_valid(i)
+    dtlb.io.hold_stq(i).bits  := tlb_vpn(stq_addr(i).bits)
+  }
 
   io.ptw <> dtlb.io.ptw
   io.core.perf.tlbMiss := io.ptw.req.fire
@@ -515,24 +535,37 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
 
 
   // Enqueue into the retry queue
+  // A miss whose sector is not already locked, and which has no free
+  // sectored victim, must stay in the LDQ/STQ. Otherwise the depth-8 retry
+  // queue fills with the third page and the translation that holds the lock
+  // never gets to replay and release it.
+  val tlb_retry_room = !dtlb.io.no_sectored_victim
+  val ldq_retry_eligible = VecInit((0 until numLdqEntries).map(entryIdx =>
+    ldq_valid(entryIdx) && ldq_addr(entryIdx).valid && ldq_addr_is_virtual(entryIdx) &&
+      (tlb_sector_covered(ldq_addr(entryIdx).bits) || tlb_retry_room)))
+  val stq_retry_eligible = VecInit((0 until numStqEntries).map(entryIdx =>
+    stq_valid(entryIdx) && stq_addr(entryIdx).valid && stq_addr_is_virtual(entryIdx) &&
+      (tlb_sector_covered(stq_addr(entryIdx).bits) || tlb_retry_room)))
   val ldq_enq_retry_idx = Reg(UInt((1+ldqAddrSz).W))
-  ldq_enq_retry_idx := LSUAgePriorityEncoder((0 until numLdqEntries).map(i => {
-    ldq_addr(i).valid && ldq_addr_is_virtual(i) && (i.U =/= GetRealLSQIdx(ldq_enq_retry_idx))
+  ldq_enq_retry_idx := LSUAgePriorityEncoder((0 until numLdqEntries).map(entryIdx => {
+    ldq_retry_eligible(entryIdx) && (entryIdx.U =/= GetRealLSQIdx(ldq_enq_retry_idx))
   }), ldq_head)
   val ldq_enq_retry_e = WireInit(ldq_read(ldq_enq_retry_idx))
 
   val stq_enq_retry_idx = Reg(UInt((1+stqAddrSz).W))
-  stq_enq_retry_idx := LSUAgePriorityEncoder((0 until numStqEntries).map(i => {
-    stq_addr(i).valid && stq_addr_is_virtual(i) && (i.U =/= GetRealLSQIdx(stq_enq_retry_idx))
+  stq_enq_retry_idx := LSUAgePriorityEncoder((0 until numStqEntries).map(entryIdx => {
+    stq_retry_eligible(entryIdx) && (entryIdx.U =/= GetRealLSQIdx(stq_enq_retry_idx))
   }), stq_commit_head)
   val stq_enq_retry_e   = WireInit(stq_read(stq_enq_retry_idx))
 
   val can_enq_load_retry    = (ldq_enq_retry_e.valid                            &&
                                ldq_enq_retry_e.bits.addr.valid                  &&
-                               ldq_enq_retry_e.bits.addr_is_virtual)
+                               ldq_enq_retry_e.bits.addr_is_virtual             &&
+                               (tlb_sector_covered(ldq_enq_retry_e.bits.addr.bits) || tlb_retry_room))
   val can_enq_store_retry   = (stq_enq_retry_e.valid                            &&
                                stq_enq_retry_e.bits.addr.valid                  &&
-                               stq_enq_retry_e.bits.addr_is_virtual)
+                               stq_enq_retry_e.bits.addr_is_virtual             &&
+                               (tlb_sector_covered(stq_enq_retry_e.bits.addr.bits) || tlb_retry_room))
 
   val retry_queue = Module(new BranchKillableQueue(new MemGen, 8))
   retry_queue.io.brupdate := io.core.brupdate
@@ -979,6 +1012,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq_uop                (ldq_idx).pdst   := exe_tlb_uop(w).pdst
       ldq_addr_is_virtual    (ldq_idx)        := exe_tlb_miss(w)
       ldq_addr_is_uncacheable(ldq_idx)        := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
+      when (!exe_agen_killed(w) || will_fire_load_retry(w)) {
+        ldq_tlb_hold(ldq_idx) := exe_tlb_miss(w)
+      }
 
       assert(!ldq_addr(ldq_idx).valid,
         "[lsu] Translating load is overwriting a valid address")
@@ -994,6 +1030,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       stq_uop            (stq_idx).pdst  := exe_tlb_uop(w).pdst // Needed for AMOs
       stq_addr_is_virtual(stq_idx)       := exe_tlb_miss(w)
       stq_addr_is_uncacheable(stq_idx)   := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
+      when ((!exe_agen_killed(w) || will_fire_store_retry(w)) && !pf_st(w)) {
+        stq_tlb_hold(stq_idx) := exe_tlb_miss(w)
+      }
 
       assert(!stq_addr(stq_idx).valid,
         "[lsu] Translating store is overwriting a valid address")
@@ -1519,6 +1558,11 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     iresp(w).bits  := DontCare
     fresp(w).valid := false.B
     fresp(w).bits  := DontCare
+    // DontCare must not leak into fflags.  Integer responses never dirty FS.
+    iresp(w).bits.fflags.valid := false.B
+    iresp(w).bits.fflags.bits  := 0.U
+    fresp(w).bits.fflags.valid := false.B
+    fresp(w).bits.fflags.bits  := 0.U
     io.core.iresp(w) := (if (enableFastLoadUse) iresp(w) else RegNext(
       UpdateBrMask(io.core.brupdate, io.core.exception, iresp(w))))
     io.core.fresp(w) := fresp(w)
@@ -1590,6 +1634,10 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
         iresp(w).bits.data := resp.data
         fresp(w).valid     := send_fresp
         fresp(w).bits.data := resp.data
+        // fld/flw write an f register but raise no fflags.  The ROB only
+        // signals set_fs_dirty from fflags.valid, so present a zero flag write.
+        fresp(w).bits.fflags.valid := send_fresp
+        fresp(w).bits.fflags.bits  := 0.U
 
         assert(send_iresp ^ send_fresp)
         dmem_resp_fired(w) := true.B
@@ -1659,6 +1707,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       fresp(w).bits.uop  := forward_uop
       iresp(w).bits.data := loadgen.data
       fresp(w).bits.data := loadgen.data
+      fresp(w).bits.fflags.valid := forward_uop.dst_rtype === RT_FLT
+      fresp(w).bits.fflags.bits  := 0.U
 
       ldq_will_succeed   (f_idx) := true.B
       ldq_forward_std_val(f_idx) := true.B
@@ -1983,7 +2033,15 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
   }
 
-
+  // Last assignment. A slot that is already invalid must not keep the
+  // previous uop's hold across reuse. Kill/commit/exception drop ldq_valid
+  // first; the lock releases on the next cycle via hold.valid.
+  for (i <- 0 until numLdqEntries) {
+    when (!ldq_valid(i)) { ldq_tlb_hold(i) := false.B }
+  }
+  for (i <- 0 until numStqEntries) {
+    when (!stq_valid(i)) { stq_tlb_hold(i) := false.B }
+  }
 
 }
 
