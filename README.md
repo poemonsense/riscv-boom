@@ -89,8 +89,12 @@ make emu CONFIG=SmallBoomConfig -j"$(nproc)"
 ```
 
 Use `make verilog CONFIG=SmallBoomConfig` to generate RTL only. Outputs are
-isolated by configuration under `build/boom-<CONFIG>/build/`; the emulator is
-`build/boom-<CONFIG>/build/emu`. `BUILD_DIR` can select another output directory.
+written directly under `build/`: RTL in `build/rtl/`, DiffTest interfaces and
+profiles in `build/generated-src/`, and the emulator at `build/emu`.
+`NOOP_HOME` selects the output root and defaults to the source directory;
+`BUILD_DIR` is derived as `$(NOOP_HOME)/build`. To keep configurations separate,
+pass the same `NOOP_HOME=build/boom-<CONFIG>` to `verilog`, `emu`, and `clean`.
+The default `build/` is shared between configurations.
 
 `SmallBoomFpgaConfig`, `MediumBoomFpgaConfig`, and `LargeBoomFpgaConfig` select
 the same core sizes with external MMIO AXI for the board UART16550 at
@@ -132,7 +136,7 @@ contain the `boom-mem2g` DTS profile:
 
 ```sh
 make -C ../workload-builder linux/hello DEFAULT_DTB=boom-mem2g -j"$(nproc)"
-build/boom-SmallBoomConfig/build/emu \
+build/emu \
   -i ../workload-builder/build/linux-workloads/hello/fw_payload.bin \
   --diff "$NEMU_HOME/build/riscv64-nemu-interpreter-so" --ram-size=2GB
 ```

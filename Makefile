@@ -13,28 +13,33 @@ CONFIG ?= MediumBoomConfig
 MEM_SIZE ?= 0x80000000
 DIFFTEST_CONFIG ?=
 TOP ?= SimTop
-BUILD_DIR ?= $(abspath build/boom-$(CONFIG))
-RTL_DIR := $(BUILD_DIR)/build/rtl
+NOOP_HOME ?= $(CURDIR)
+BUILD_DIR = $(abspath $(NOOP_HOME))/build
+RTL_DIR := $(abspath $(BUILD_DIR))/rtl
 MILL ?= mill
 MILL_VERSION ?= 0.11.1
 
 verilog:
 	mkdir -p $(RTL_DIR)
-	NOOP_HOME=$(BUILD_DIR) MILL_VERSION=$(MILL_VERSION) \
+	NOOP_HOME=$(abspath $(NOOP_HOME)) MILL_VERSION=$(MILL_VERSION) \
 		$(MILL) -i boom.runMain boom.v4.system.Generator \
 		--top $(TOP) --config $(CONFIG) --mem-size $(MEM_SIZE) --target-dir $(RTL_DIR) \
 		--target systemverilog --split-verilog \
 		$(if $(strip $(DIFFTEST_CONFIG)),--difftest-config $(DIFFTEST_CONFIG),)
 	test -s $(RTL_DIR)/$(TOP).sv
-	test -s $(BUILD_DIR)/build/generated-src/difftest_profile.json
+	test -s $(BUILD_DIR)/generated-src/difftest_profile.json
 
 emu: verilog
-	$(MAKE) -C difftest emu NOOP_HOME=$(BUILD_DIR) \
-		DESIGN_DIR=$(BUILD_DIR) BUILD_DIR=$(BUILD_DIR)/build SIM_TOP=$(TOP) NUM_CORES=1 \
+	$(MAKE) -C difftest emu NOOP_HOME=$(abspath $(NOOP_HOME)) SIM_TOP=$(TOP) NUM_CORES=1 \
 		WITH_CHISELDB=0 WITH_CONSTANTIN=0
 
 clean:
-	@case "$(BUILD_DIR)" in \
-		"$(CURDIR)"/build/*|/tmp/boom-*) rm -rf -- "$(BUILD_DIR)" ;; \
+	@build_dir=$$(realpath -m -- "$(BUILD_DIR)") || exit $$?; \
+	repo_dir=$$(pwd -P); \
+	case "$$repo_dir/" in \
+		"$$build_dir/"*) echo "refusing to remove source directory: $$build_dir" >&2; exit 2 ;; \
+	esac; \
+	case "$$build_dir" in \
+		"$$repo_dir"/build|"$$repo_dir"/build/*|/tmp/boom-*) rm -rf -- "$$build_dir" ;; \
 		*) echo "refusing to remove BUILD_DIR: $(BUILD_DIR)" >&2; exit 2 ;; \
 	esac
